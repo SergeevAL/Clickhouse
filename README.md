@@ -313,3 +313,216 @@ optimize table clicks final;
 |20210116_1_2_1|1     |100 |
 |20210116_2_2_0|0     |50  |
 +--------------+------+----+
+
+
+Часть про реплецирование и шардированние
+
+ClickHouse специально проектировался для работы в кластерах, расположенных в разных дата-центрах. Масштабируется СУБД линейно до сотен узлов. Так, например, Яндекс.Метрика на момент написания статьи — это кластер из более чем 400 узлов.
+
+
+ClickHouse предоставляет шардирование и репликацию "из коробки", они могут гибко настраиваться отдельно для каждой таблицы. Для обеспечения реплицирования требуется Apache ZooKeeper (рекомендуется использовать версию 3.4.5+). Для более высокой надежности мы используем ZK-кластер (ансамбль) из 5 узлов. Следует выбирать нечетное число ZK-узлов (например, 3 или 5), чтобы обеспечить кворум. Также отметим, что ZK не используется в операциях SELECT, а применяется, например, в ALTER-запросах для изменений столбцов, сохраняя инструкции для каждой из реплик.
+
+
+Шардирование
+
+Шардирование в ClickHouse позволяет записывать и хранить порции данных в кластере распределенно и обрабатывать (читать) данные параллельно на всех узлах кластера, увеличивая throughput и уменьшая latency. Например, в запросах с GROUP BY ClickHouse выполнит агрегирование на удаленных узлах и передаст узлу-инициатору запроса промежуточные состояния агрегатных функций, где они будут доагрегированы.
+
+
+Для шардирования используется специальный движок Distributed, который не хранит данные, а делегирует SELECT-запросы на шардированные таблицы (таблицы, содержащие порции данных) с последующей обработкой полученных данных. Запись данных в шарды может выполняться в двух режимах: 1) через Distributed-таблицу и необязательный ключ шардирования или 2) непосредственно в шардированные таблицы, из которых далее данные будут читаться через Distributed-таблицу. Рассмотрим эти режимы более подробно.
+
+
+В первом режиме данные записываются в Distributed-таблицу по ключу шардирования. В простейшем случае ключом шардирования может быть случайное число, т. е. результат вызова функции rand(). Однако в качестве ключа шардирования рекомендуется брать значение хеш-функции от поля в таблице, которое позволит, с одной стороны, локализовать небольшие наборы данных на одном шарде, а с другой — обеспечит достаточно ровное распределение таких наборов по разным шардам в кластере. Например, идентификатор сессии (sess_id) пользователя позволит локализовать показы страниц одному пользователю на одном шарде, при этом сессии разных пользователей будут распределены равномерно по всем шардам в кластере (при условии, что значения поля sess_id будут иметь хорошее распределение). Ключ шардирования может быть также нечисловым или составным. В этом случае можно использовать встроенную хеширующую функцию cityHash64. В рассматриваемом режиме данные, записываемые на один из узлов кластера, по ключу шардирования будут перенаправляться на нужные шарды автоматически, увеличивая, однако, при этом трафик.
+
+
+Более сложный способ заключается в том, чтобы вне ClickHouse вычислять нужный шард и выполнять запись напрямую в шардированную таблицу. Сложность здесь обусловлена тем, что нужно знать набор доступных узлов-шардов. Однако в этом случае запись становится более эффективной, и механизм шардирования (определения нужного шарда) может быть более гибким.
+
+
+Репликация
+
+ClickHouse поддерживает репликацию данных, обеспечивая целостность данных на репликах. Для репликации данных используются специальные движки MergeTree-семейства:
+
+
+ReplicatedMergeTree
+ReplicatedCollapsingMergeTree
+ReplicatedAggregatingMergeTree
+ReplicatedSummingMergeTree
+
+Репликация часто применяется вместе с шардированием. Например, кластер из 6 узлов может содержать 3 шарда по 2 реплики. Следует отметить, что репликация не зависит от механизмов шардирования и работает на уровне отдельных таблиц.
+
+
+Запись данных может выполняться в любую из таблиц-реплик, ClickHouse выполняет автоматическую синхронизацию данных между всеми репликами.
+
+
+Примеры конфигурации ClickHouse-кластера
+
+В качестве примеров будем рассматривать различные конфигурации для четырех узлов: ch63.smi2, ch64.smi2, ch65.smi2, ch66.smi2. Настройки содержатся в конфигурационном файле /etc/clickhouse-server/config.xml.
+
+
+Один шард и четыре реплики
+
+<remote_servers>
+    <!-- One shard, four replicas -->
+    <repikator>
+       <shard>
+           <!-- replica 01_01 -->
+           <replica>
+               <host>ch63.smi2</host>
+           </replica>
+
+           <!-- replica 01_02 -->
+           <replica>
+               <host>ch64.smi2</host>
+           </replica>
+
+           <!-- replica 01_03 -->
+           <replica>
+               <host>ch65.smi2</host>
+           </replica>
+
+           <!-- replica 01_04 -->
+           <replica>
+               <host>ch66.smi2</host>
+           </replica>
+       </shard>
+    </repikator>
+</remote_servers>
+
+Пример SQL-запроса создания таблицы для указанной конфигурации:
+CREATE DATABASE IF NOT EXISTS dbrepikator
+;
+
+CREATE TABLE IF NOT EXISTS dbrepikator.anysumming_repl_sharded (
+    event_date Date DEFAULT toDate(event_time),
+    event_time DateTime DEFAULT now(),
+    body_id Int32,
+    views Int32
+) ENGINE = ReplicatedSummingMergeTree('/clickhouse/tables/{repikator_replica}/dbrepikator/anysumming_repl_sharded', '{replica}', event_date, (event_date, event_time, body_id), 8192)
+;
+
+CREATE TABLE IF NOT EXISTS  dbrepikator.anysumming_repl AS dbrepikator.anysumming_repl_sharded
+      ENGINE = Distributed( repikator, dbrepikator, anysumming_repl_sharded , rand() )
+      
+Преимущество данной конфигурации:
+
+
+Наиболее надежный способ хранения данных.
+
+Недостатки:
+
+
+Для большинства задач будет храниться избыточное количество копий данных.
+Поскольку в данной конфигурации только 1 шард, SELECT-запрос не может выполняться параллельно на разных узлах.
+Требуются дополнительные ресурсы на многократное реплицирование данных между всеми узлами.
+
+Четыре шарда по одной реплике
+<remote_servers>
+    <!-- Four shards, one replica -->
+    <sharovara>
+       <!-- shard 01 -->
+       <shard>
+           <!-- replica 01_01 -->
+           <replica>
+               <host>ch63.smi2</host>
+           </replica>
+       </shard>
+
+       <!-- shard 02 -->
+       <shard>
+           <!-- replica 02_01 -->
+           <replica>
+               <host>ch64.smi2</host>
+           </replica>
+       </shard>
+
+       <!-- shard 03 -->
+       <shard>
+           <!-- replica 03_01 -->
+           <replica>
+               <host>ch65.smi2</host>
+           </replica>
+       </shard>
+
+       <!-- shard 04 -->
+       <shard>
+           <!-- replica 04_01 -->
+           <replica>
+               <host>ch66.smi2</host>
+           </replica>
+       </shard>
+    </sharovara>
+</remote_servers>
+
+CREATE DATABASE IF NOT EXISTS testshara 
+;
+CREATE TABLE IF NOT EXISTS testshara.anysumming_sharded (
+    event_date Date DEFAULT toDate(event_time),
+    event_time DateTime DEFAULT now(),
+    body_id Int32,
+    views Int32
+) ENGINE = ReplicatedSummingMergeTree('/clickhouse/tables/{sharovara_replica}/sharovara/anysumming_sharded_sharded', '{replica}', event_date, (event_date, event_time, body_id), 8192)
+;
+CREATE TABLE IF NOT EXISTS  testshara.anysumming AS testshara.anysumming_sharded
+      ENGINE = Distributed( sharovara, testshara, anysumming_sharded , rand() )
+      
+Преимущество данной конфигурации:
+
+
+Поскольку в данной конфигурации 4 шарда, SELECT-запрос может выполняться параллельно сразу на всех узлах кластера.
+
+Недостаток:
+
+
+Наименее надежный способ хранения данных (потеря узла приводит к потере порции данных).
+
+Два шарда по две реплики
+
+<remote_servers>
+    <!-- Two shards, two replica -->
+    <pulse>
+        <!-- shard 01 -->
+       <shard>
+           <!-- replica 01_01 -->
+           <replica>
+               <host>ch63.smi2</host>
+           </replica>
+
+           <!-- replica 01_02 -->
+           <replica>
+               <host>ch64.smi2</host>
+           </replica>
+       </shard>
+
+       <!-- shard 02 -->
+       <shard>
+           <!-- replica 02_01 -->
+           <replica>
+               <host>ch65.smi2</host>
+           </replica>
+
+           <!-- replica 02_02 -->
+           <replica>
+               <host>ch66.smi2</host>
+           </replica>
+       </shard>
+    </pulse>
+</remote_servers>
+
+CREATE DATABASE IF NOT EXISTS dbpulse 
+;
+
+CREATE TABLE IF NOT EXISTS dbpulse.normal_summing_sharded (
+    event_date Date DEFAULT toDate(event_time),
+    event_time DateTime DEFAULT now(),
+    body_id Int32,
+    views Int32
+) ENGINE = ReplicatedSummingMergeTree('/clickhouse/tables/{pulse_replica}/pulse/normal_summing_sharded', '{replica}', event_date, (event_date, event_time, body_id), 8192)
+;
+
+CREATE TABLE IF NOT EXISTS  dbpulse.normal_summing AS dbpulse.normal_summing_sharded
+      ENGINE = Distributed( pulse, dbpulse, normal_summing_sharded , rand() )
+      
+Данная конфигурация воплощает лучшие качества из первого и второго примеров:
+
+
+Поскольку в данной конфигурации 2 шарда, SELECT-запрос может выполняться параллельно на каждом из шардов в кластере.
+Относительно надежный способ хранения данных (потеря одного узла кластера не приводит к потере порции данных).
